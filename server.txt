@@ -1,0 +1,359 @@
+/**
+* Web Latency Testing Server
+* Provides signaling and echo functionality for latency measurements
+*/
+require('dotenv').config({ quiet: true });
+const wrtc = require('@roamhq/wrtc');
+const WebSocket = require('ws');
+const https = require('https');
+const fs = require('fs');
+ 
+// Configuration
+const PORT = process.env.PORT || 8443;
+const HOST = process.env.HOST || '<PUBLIC_IPV6>';
+const USE_HTTPS = process.env.USE_HTTPS === 'true';
+const CERT_PATH = process.env.CERT_PATH;
+const KEY_PATH = process.env.KEY_PATH;
+const CA_PATH = process.env.CA_PATH;
+ 
+console.log('Starting Web Latency Server...');
+console.log('Configuration:');
+console.log(`PORT: ${PORT}`);
+console.log(`HOST: ${HOST}`);
+console.log(`USE_HTTPS: ${USE_HTTPS}`);
+console.log(`CERT_PATH: ${CERT_PATH || 'Not specified'}`);
+console.log(`KEY_PATH: ${KEY_PATH || 'Not specified'}`);
+console.log(`CA_PATH: ${CA_PATH || 'Not specified'}`);
+ 
+let server;
+let wss;
+ 
+/**
+* Test certificate files before starting server
+*/
+function testCertificates() {
+    if (!USE_HTTPS) {
+        console.log('HTTPS disabled, skipping certificate tests');
+        return true;
+    }
+ 
+    console.log('Testing certificate files...');
+ 
+    // Test certificate file
+    try {
+        if (!fs.existsSync(CERT_PATH)) {
+            console.error(`ERROR: Certificate file not found: ${CERT_PATH}`);
+            return false;
+        }
+        const certData = fs.readFileSync(CERT_PATH, 'utf8');
+        console.log(`Certificate file readable (${certData.length} bytes)`);
+        if (certData.includes('BEGIN CERTIFICATE')) {
+            console.log('Certificate file appears to be valid PEM format');
+        } else {
+            console.warn('WARNING: Certificate file might not be in PEM format');
+        }
+    } catch (error) {
+        console.error(`ERROR: Error reading certificate: ${error.message}`);
+        return false;
+    }
+ 
+    // Test private key file
+    try {
+        if (!fs.existsSync(KEY_PATH)) {
+            console.error(`ERROR: Private key file not found: ${KEY_PATH}`);
+            return false;
+        }
+        const keyData = fs.readFileSync(KEY_PATH, 'utf8');
+        console.log(`Private key file readable (${keyData.length} bytes)`);
+        if (keyData.includes('BEGIN PRIVATE KEY') || keyData.includes('BEGIN RSA PRIVATE KEY')) {
+            console.log('Private key file appears to be valid PEM format');
+        } else {
+            console.warn('WARNING: Private key file might not be in PEM format');
+        }
+    } catch (error) {
+        console.error(`ERROR: Error reading private key: ${error.message}`);
+        return false;
+    }
+ 
+    // Test CA file if specified
+    if (CA_PATH) {
+        try {
+            if (!fs.existsSync(CA_PATH)) {
+                console.error(`ERROR: CA certificate file not found: ${CA_PATH}`);
+                return false;
+            }
+            const caData = fs.readFileSync(CA_PATH, 'utf8');
+            console.log(`CA certificate file readable (${caData.length} bytes)`);
+            if (caData.includes('BEGIN CERTIFICATE')) {
+                console.log('CA certificate file appears to be valid PEM format');
+            } else {
+                console.warn('WARNING: CA certificate file might not be in PEM format');
+            }
+        } catch (error) {
+            console.error(`ERROR: Error reading CA certificate: ${error.message}`);
+            return false;
+        }
+    }
+ 
+    return true;
+}
+ 
+/**
+* Create and start the server
+*/
+function startServer() {
+    if (USE_HTTPS) {
+        console.log('Starting HTTPS server...');
+ 
+        try {
+            const serverOptions = {
+                cert: fs.readFileSync(CERT_PATH),
+                key: fs.readFileSync(KEY_PATH)
+            };
+ 
+            if (CA_PATH && fs.existsSync(CA_PATH)) {
+                serverOptions.ca = fs.readFileSync(CA_PATH);
+                console.log('Including CA certificate chain');
+            }
+ 
+            server = https.createServer(serverOptions);
+            wss = new WebSocket.Server({ server });
+ 
+            server.listen(PORT, HOST, () => {
+                console.log('Secure signaling server started successfully!');
+                console.log(`Local access: wss://localhost:${PORT}`);
+                console.log(`Listening on: ${HOST}:${PORT}`);
+            });
+ 
+            server.on('error', (error) => {
+                console.error('ERROR: HTTPS Server error:', error);
+                if (error.code === 'EADDRINUSE') {
+                    console.error(`ERROR: Port ${PORT} is already in use!`);
+                    console.log('TIP: Try: sudo lsof -i :' + PORT + ' to see what\'s using it');
+                } else if (error.code === 'EACCES') {
+                    console.error(`ERROR: Permission denied for port ${PORT}`);
+                    console.log('TIP: Ports below 1024 require sudo privileges');
+                } else if (error.code === 'ENOTFOUND') {
+                    console.error(`ERROR: Host ${HOST} not found`);
+                }
+                process.exit(1);
+            });
+ 
+            server.on('clientError', (err, socket) => {
+                console.error('ERROR: Client error:', err.message);
+            });
+ 
+        } catch (error) {
+            console.error('ERROR: Failed to create HTTPS server:', error.message);
+            console.error('Full error:', error);
+            process.exit(1);
+        }
+    } else {
+        console.log('Starting HTTP WebSocket server...');
+ 
+        try {
+            wss = new WebSocket.Server({
+                port: PORT,
+                host: HOST
+            });
+ 
+            console.log('WebSocket server started successfully!');
+            console.log(`Local access: ws://localhost:${PORT}`);
+            console.log(`Listening on: ${HOST}:${PORT}`);
+ 
+        } catch (error) {
+            console.error('ERROR: Failed to create WebSocket server:', error.message);
+            process.exit(1);
+        }
+    }
+}
+ 
+/**
+* Set up WebSocket connection handlers
+*/
+function setupWebSocketHandlers() {
+    console.log('Setting up WebSocket connection handlers...');
+ 
+    wss.on('connection', (ws, req) => {
+        const clientIp = req.socket.remoteAddress;
+        const userAgent = req.headers['user-agent'] || 'Unknown';
+        const protocol = USE_HTTPS ? 'WSS' : 'WS';
+ 
+        console.log(`\n${protocol} client connected!`);
+        console.log(`IP: ${clientIp}`);
+        console.log(`User-Agent: ${userAgent}`);
+        console.log(`Connection time: ${new Date().toISOString()}`);
+ 
+        // Connection mode state - 'webrtc' or 'websocket'
+        let connectionMode = null;
+        let isWebSocketMode = false;
+ 
+        const peerConnection = new wrtc.RTCPeerConnection({
+            iceServers: [
+                { urls: process.env.WEBRTC_STUN_SERVER || 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' }
+            ],
+            portRange: {
+                min: parseInt(process.env.WEBRTC_UDP_PORT_MIN) || 10000,
+                max: parseInt(process.env.WEBRTC_UDP_PORT_MAX) || 20000,
+            }
+        });
+ 
+        // Handle ICE candidate generation
+        peerConnection.onicecandidate = event => {
+            if (event.candidate) {
+                console.log('Sending ICE candidate to client');
+                ws.send(JSON.stringify({ 'candidate': event.candidate }));
+            }
+        };
+ 
+        // Handle data channel creation
+        peerConnection.ondatachannel = event => {
+            const dataChannel = event.channel;
+            console.log(`Data channel "${dataChannel.label}" opened`);
+ 
+            dataChannel.onmessage = messageEvent => {
+                dataChannel.send(messageEvent.data);
+            };
+ 
+            dataChannel.onclose = () => {
+                console.log(`Data channel "${dataChannel.label}" closed`);
+            };
+        };
+ 
+        peerConnection.onconnectionstatechange = () => {
+            console.log(`Connection state: ${peerConnection.connectionState}`);
+            if (peerConnection.connectionState === 'disconnected' ||
+                peerConnection.connectionState === 'failed') {
+                ws.close();
+            }
+        };
+ 
+        // Handle signaling messages and WebSocket mode
+        ws.on('message', async (message) => {
+            // Handle binary WebSocket messages
+            if (message instanceof Buffer || message instanceof ArrayBuffer) {
+                if (isWebSocketMode) {
+                    ws.send(message);
+                    return;
+                }
+            }
+ 
+            try {
+                const signal = JSON.parse(message);
+ 
+                // Handle WebSocket TCP mode messages
+                if (signal.type === 'websocket_mode_init') {
+                    console.log('Client requesting WebSocket mode');
+                    connectionMode = 'websocket';
+                    isWebSocketMode = true;
+                    ws.send(JSON.stringify({
+                        type: 'websocket_mode_ready',
+                        message: 'Server ready for WebSocket TCP mode'
+                    }));
+                    return;
+                }
+ 
+                // Handle WebSocket ping in TCP mode
+                if (signal.type === 'websocket_ping' && isWebSocketMode) {
+                    // Echo back the ping as pong immediately
+                    ws.send(JSON.stringify({
+                        type: 'websocket_pong',
+                        sequence: signal.sequence,
+                        timestamp: signal.timestamp,
+                        serverTimestamp: Date.now()
+                    }));
+                    return;
+                }
+ 
+                // Handle WebRTC signaling messages
+                if (signal.sdp) {
+                    console.log('Received SDP offer from client');
+                    connectionMode = 'webrtc';
+                    try {
+                        await peerConnection.setRemoteDescription(signal.sdp);
+                        const answer = await peerConnection.createAnswer();
+                        await peerConnection.setLocalDescription(answer);
+                        console.log('Sending SDP answer to client');
+                        ws.send(JSON.stringify({ 'sdp': peerConnection.localDescription }));
+                    } catch (e) {
+                        console.error("ERROR: Error processing SDP:", e);
+                    }
+                } else if (signal.candidate) {
+                    console.log('Received ICE candidate from client');
+                    try {
+                        await peerConnection.addIceCandidate(signal.candidate);
+                    } catch (e) {
+                        console.error("ERROR: Error adding ICE candidate:", e);
+                    }
+                } else {
+                    console.log('Received other message:', signal);
+                }
+            } catch (e) {
+                console.error("ERROR: Error processing message:", e);
+            }
+        });
+ 
+        ws.on('close', (code, reason) => {
+            console.log(`${protocol} client disconnected (code: ${code}, reason: ${reason})`);
+            console.log(`Connection was using: ${connectionMode || 'unknown'} mode`);
+            if (!isWebSocketMode) {
+                peerConnection.close();
+            }
+        });
+ 
+        ws.on('error', (error) => {
+            console.error(`ERROR: ${protocol} WebSocket error:`, error);
+            peerConnection.close();
+        });
+    });
+ 
+    wss.on('error', (error) => {
+        console.error('ERROR: WebSocket Server error:', error);
+        if (error.code === 'EADDRINUSE') {
+            console.error(`Port ${PORT} is already in use!`);
+            console.log(`TIP: Run: sudo lsof -i :${PORT}`);
+        }
+    });
+ 
+    console.log('WebSocket handlers configured successfully');
+}
+ 
+// Main execution
+console.log('Testing certificates...');
+if (!testCertificates()) {
+    console.error('ERROR: Certificate test failed. Exiting.');
+    process.exit(1);
+}
+ 
+console.log('Starting server...');
+startServer();
+setupWebSocketHandlers();
+ 
+// Graceful shutdown
+process.on('SIGINT', () => {
+    console.log('\nShutting down server...');
+    wss.close(() => {
+        if (server) {
+            server.close(() => {
+                console.log('Server closed gracefully');
+                process.exit(0);
+            });
+        } else {
+            console.log('Server closed gracefully');
+            process.exit(0);
+        }
+    });
+});
+ 
+process.on('SIGTERM', () => {
+    console.log('Received SIGTERM, shutting down gracefully...');
+    wss.close(() => {
+        if (server) {
+            server.close(() => process.exit(0));
+        } else {
+            process.exit(0);
+        }
+    });
+});
